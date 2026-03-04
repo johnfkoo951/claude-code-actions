@@ -1,0 +1,220 @@
+name: "Claude Code Report"
+
+# 매일 KST 오전 8시 자동 실행
+# Actions 탭 Summary에서 워크플로우 실행 현황 리포트 확인 가능
+
+on:
+  schedule:
+    - cron: "0 23 * * *"  # UTC 23:00 = KST 08:00 next day
+
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "조회 기간 (일)"
+        required: false
+        default: "7"
+        type: string
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+      issues: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Collect Workflow Data
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DAYS="${{ github.event.inputs.days || '7' }}"
+          echo "Collecting workflow data from last $DAYS days..."
+
+          # All workflow runs (up to 200)
+          gh run list --limit 200 \
+            --json databaseId,displayTitle,status,conclusion,createdAt,updatedAt,event,workflowName,headBranch \
+            > /tmp/all-runs.json
+
+          # Registered workflows
+          gh workflow list --json id,name,state > /tmp/workflows.json
+
+          # Open issues
+          gh issue list --state open --json number,title,labels,createdAt > /tmp/issues.json
+
+          # Output directory stats
+          echo "=== Output Directory Stats ===" > /tmp/output-stats.txt
+          for dir in output/*/; do
+            if [ -d "$dir" ]; then
+              count=$(find "$dir" -name "*.md" -type f | wc -l | tr -d ' ')
+              latest=$(find "$dir" -name "*.md" -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+              if [ -z "$latest" ]; then
+                latest=$(ls -t "$dir"*.md 2>/dev/null | head -1)
+              fi
+              echo "$dir | $count files | latest: $latest" >> /tmp/output-stats.txt
+            fi
+          done
+
+          echo "=== Collection Summary ==="
+          echo "Runs: $(jq length /tmp/all-runs.json)"
+          echo "Workflows: $(jq length /tmp/workflows.json)"
+          echo "Open Issues: $(jq length /tmp/issues.json)"
+          cat /tmp/output-stats.txt
+
+      - name: Create MCP Config
+        run: |
+          cat > /tmp/mcp-config.json << 'MCPEOF'
+          {
+            "mcpServers": {
+              "sequential-thinking": {
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+              }
+            }
+          }
+          MCPEOF
+
+      - name: Generate Claude Code Report
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: |
+            --mcp-config /tmp/mcp-config.json
+            --dangerously-skip-permissions
+
+          prompt: |
+            You are a DevOps reporting assistant for the claude-code-actions repository.
+            Your job is to generate a clear, concise execution report in Korean.
+
+            ## Data Files
+            Read these files to understand the current state:
+            - /tmp/all-runs.json — All GitHub Actions workflow runs
+            - /tmp/workflows.json — Registered workflow definitions
+            - /tmp/issues.json — Open GitHub issues
+            - /tmp/output-stats.txt — Output directory file counts
+
+            Also check the output/ directory for generated content.
+
+            ## Report Period
+            Focus on the last ${{ github.event.inputs.days || '7' }} days for run history.
+
+            ## Task
+            Generate a markdown report and save it to TWO locations:
+            1. output/reports/$(date +%Y-%m-%d).md (permanent record in repo)
+            2. /tmp/report-summary.md (for GitHub Actions step summary display)
+
+            Both files should have IDENTICAL content.
+
+            ## Report Format
+
+            ```markdown
+            # 🤖 Claude Code Report — YYYY-MM-DD
+
+            > 이 레포의 GitHub Actions 워크플로우 실행 현황 리포트입니다.
+            > 조회 기간: 최근 N일
+
+            ---
+
+            ## 📊 실행 현황 요약
+
+            | 지표 | 값 |
+            |------|-----|
+            | 등록된 워크플로우 | N개 |
+            | 최근 N일 실행 횟수 | N회 |
+            | 성공 | N회 ✅ |
+            | 실패 | N회 ❌ |
+            | 성공률 | N% |
+            | 가장 최근 실행 | YYYY-MM-DD HH:MM (KST) |
+
+            ---
+
+            ## ✅ 워크플로우별 실행 이력
+
+            ### [워크플로우 이름]
+            > 스케줄: [cron 설명] | 트리거: [schedule/manual/event]
+
+            | 실행일시 (KST) | 트리거 | 상태 | 제목 |
+            |---------------|--------|------|------|
+            | MM-DD HH:MM | cron/manual | ✅/❌ | 표시 제목 |
+
+            (각 워크플로우를 반복. 실행 이력이 없으면 "🔘 미실행"으로 표시)
+
+            ---
+
+            ## 📁 생성된 콘텐츠
+
+            | 폴더 | 파일 수 | 최근 생성 파일 |
+            |------|---------|--------------|
+            | output/research-digest/ | N개 | YYYY-MM-DD.md |
+            | output/genai-class/ | N개 | week-01-YYYY-MM-DD.md |
+            | output/newsletter/ | N개 | ... |
+            | output/learning/ | N개 | ... |
+            | output/reports/ | N개 | ... |
+            | output/repo-health/ | N개 | ... |
+
+            ---
+
+            ## ⚠️ 주의 사항
+
+            - 실패한 워크플로우가 있으면 원인 분석 및 조치 제안
+            - 연쇄 트리거가 감지되면 경고 (예: Issue 생성 → Step 1 트리거)
+            - 오래된 cron 워크플로우가 실행되지 않았으면 알림
+            - 개선 제안 (있으면)
+
+            ---
+
+            ## 📋 Open Issues (N개)
+
+            | # | 제목 | 라벨 | 생성일 |
+            |---|------|------|-------|
+
+            ---
+            *Generated by Claude Code Report — YYYY-MM-DD*
+            ```
+
+            ## Important Rules
+            - Convert ALL UTC times to KST (UTC+9)
+            - Use status emoji: ✅ success, ❌ failure, ⏳ in_progress, ⏭️ skipped, 🔘 never run
+            - Group runs by workflowName
+            - Calculate success rate (exclude in_progress)
+            - Sort workflows by most recently executed first
+            - If a registered workflow has zero runs in the period, still list it as "🔘 미실행"
+            - Keep the report concise — max 5 recent runs per workflow
+
+            ## Save and Commit
+            ```bash
+            mkdir -p output/reports
+            # Save report to both locations
+            ```
+
+            After generating the report:
+            ```bash
+            git config user.name "Claude Code Bot"
+            git config user.email "claude-bot@github-actions"
+            git add output/reports/
+            git commit -m "📊 Claude Code Report — $(date +%Y-%m-%d)"
+            git push origin main
+            ```
+
+      - name: Write Step Summary
+        if: always()
+        run: |
+          if [ -f /tmp/report-summary.md ]; then
+            cat /tmp/report-summary.md >> $GITHUB_STEP_SUMMARY
+            echo "✅ Report written to Actions Step Summary"
+          else
+            echo "⚠️ Report summary file not found. Check the 'Generate Claude Code Report' step." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            # Fallback: try to find the committed report
+            REPORT=$(ls -t output/reports/*.md 2>/dev/null | head -1)
+            if [ -n "$REPORT" ]; then
+              echo "📄 Fallback: loading from committed report" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              cat "$REPORT" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
